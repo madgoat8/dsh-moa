@@ -97,3 +97,46 @@ presets:
     # tools: { file: true, bash: false, web: true }
     tools_max_rounds: 5
 ```
+
+## 0.2.57-local.3 — 工具链修复与能力增强
+
+### 修复（来自实际运行日志）
+
+日志证据：
+```
+🔧 Tool web_search("{"queries\":[\"deepseek harness...") -> 工具执行失败: queries 不能为空
+🔧 Tool web_fetch("{"url\":\"https://github.com/deepseek-ai") -> 工具执行失败: 只支持 http(s) URL
+🔧 Tool grep_files("{"pattern\":\"harness\"}") -> 工具执行失败: pattern 不能为空
+```
+
+**根因**：pi-ai 在某些路径下把 `tool-call.arguments` 给成**原始 JSON 字符串**（甚至流式半截串），
+上游代码直接 `args.queries` 取字段必然是 `undefined`。
+
+| 修复 | 说明 |
+|---|---|
+| `parseToolArguments()` | 对象/字符串/半截 JSON 三种形态统一解析，含引号括号自动补齐 |
+| `normalizeArgs()` | 兼容 `{queries:[]}` / `{query:"x"}` / 纯字符串 / `__raw` 抢救 |
+| 错误信息带原始入参 | 失败时回灌 `原始入参: ...`，模型可自行修正，而不是盲目重试 |
+
+### 增强
+
+| 能力 | 说明 |
+|---|---|
+| **重复调用去重** | 同一 `(工具+参数)` 只执行一次，复用时提示"已执行过"，实测把 4 次重复 web_search 收敛为 1 次 |
+| **轮次预算** | 默认 5 轮，超限时**强制不带工具再要一次回答**，避免空转 |
+| **失败引导** | 某轮有工具失败时，追加提示"请修正参数或换工具，不要重复相同调用" |
+| **自动降级** | 候选 429/503 时自动用**同批次其他槽位**顶上（可用 `auto_fallback_siblings: false` 关闭） |
+| **裁判接入工具** | judge 也能 `web_search`/`web_fetch`/`read_file` 核对事实（`judge_tools: false` 可关） |
+| **web 契约适配** | DSH 的 `ctx.web.search` 是 `{ query, maxResults }`（单条），插件里翻译成多条并发合并 |
+| **结果格式化** | provider 返回 `{sources:[{title,url,snippet}]}` 等结构统一转成模型可读文本 |
+
+### 新增配置
+
+```yaml
+presets:
+  - name: default
+    tools: true
+    tools_max_rounds: 5          # 候选模型工具轮次上限
+    judge_tools: true            # 裁判是否也能用工具核对
+    auto_fallback_siblings: true # 候选挂了自动换同批次其他模型
+```
