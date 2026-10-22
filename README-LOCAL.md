@@ -140,3 +140,52 @@ presets:
     judge_tools: true            # 裁判是否也能用工具核对
     auto_fallback_siblings: true # 候选挂了自动换同批次其他模型
 ```
+
+## 0.2.57-local.4 — 模型行为差异适配（A'/B'/E'/F'）
+
+### 设计前提
+
+MoA 在本机主要用于**规划（plan）制定阶段**：三方独立出方案、judge 横向对比。
+因此**刻意保持候选之间隔离**——不做跨候选的工具结果共享，允许少量重复抓取，
+以换取三个视角的独立性。只在**单个候选内部**做去重，防止自我死循环。
+
+### A' 事前引导
+
+- 工具描述加入场景约束：
+  - `web_search` → "先用它，拿到 URL 再按需 web_fetch；同一条查询不要重复搜索"
+  - `web_fetch` → "只抓最相关的 1-2 个；同一 URL 绝不重复抓取"
+  - `list_dir` / `grep_files` / `find_files` → "仅用于本地项目；找资料请用 web_search"
+- `SYSTEM_ROLE_PROPOSER` 追加 `TOOL_USAGE_DIRECTIVE` 六条守则（先搜后抓、不重复抓、够了就停、
+  工具失败要明说、事实要引用来源、无来源标 `[unverified]`）
+
+### B' 按角色收窄工具（`ROLE_TOOL_MATRIX`）
+
+| role_persona | 工具 |
+|---|---|
+| proposer / 未指定 | 全套只读工具 |
+| architect | read_file, list_dir, grep_files, find_files, web_search, web_fetch |
+| critic | read_file, grep_files, web_search, web_fetch |
+| challenger | read_file, web_search, web_fetch |
+| fast | 无（快速模式不引入工具轮次） |
+
+### E' 健壮性
+
+- 参数为空的工具调用**不写入去重缓存**，允许下一轮带新参数重试
+- `web_fetch` 默认 12s 超时（可用 `timeoutMs` 覆盖，上限 30s）
+- 结果结构化：识别 `{statusCode/status, body:{kind, content}}`，若 content 是 JSON 字符串则解析后
+  只输出关键字段（如 `{"latest":"0.2.1-rc.2"}`），不再把整段 npm registry JSON 塞给模型
+
+### F' 事实类问题强制核验
+
+触发条件（三条全满足）：
+1. 用户问题被 `isFactualQuestion()` 判定为事实类（版本/价格/日期/是否支持/数量）
+2. 该候选**零工具调用**
+3. 回答里出现具体版本号或日期（疑似凭记忆作答）
+
+触发后追加一轮"只给 web 工具"的强制核验；无 web 工具时输出明确告警而不是静默放过。
+实测效果：模型原答「Python 3.13.2」→ 核验后更正为「3.13.7」并标注 `[unverified]`。
+
+### 未做（有意为之）
+
+- ❌ 跨候选工具结果共享 — 会削弱三方独立性
+- ❌ 模型工具可靠性统计 — 无状态更简单，plan 场景使用频率不高

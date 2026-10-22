@@ -1,6 +1,6 @@
 {
   "name": "@yongfan/dsh-moa",
-  "version": "0.2.57-local.3",
+  "version": "0.2.57-local.4",
   "description": "MoA plugin for DeepSeek Harness — local fork: pi-ai message adapter + read-only tool calling",
   "type": "module",
   "main": "lib/index.js",
