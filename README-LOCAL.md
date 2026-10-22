@@ -48,3 +48,52 @@ pnpm install --no-frozen-lockfile
 ```
 
 `cordis.patch.yml` 里 `id: dsh-moa` 的 `name` 需同步改为 `@yongfan/dsh-moa`。
+
+## 0.2.57-local.2 — 只读工具调用
+
+原版 MoA 的候选/裁判模型**无法调用任何工具**（搜索、读文件、执行命令全都没有），
+只能基于静态上下文作答。本版补齐：
+
+### 新增能力
+
+| 工具 | 说明 | 默认 |
+|---|---|---|
+| `read_file` | 读工作区文件（offset/limit 分行） | 开 |
+| `list_dir` | 列目录 | 开 |
+| `grep_files` | 正则内容搜索 | 开 |
+| `find_files` | glob 文件名查找 | 开 |
+| `web_search` | 联网搜索（走宿主 web 服务） | 开 |
+| `web_fetch` | 抓网页正文 | 开 |
+| `bash` | **只读** shell 命令（白名单） | **关** |
+
+### 关键实现细节
+
+1. **pi-ai 只认 `system 消息的 toolsAdded`**
+   `openai-completions` 的 `buildParams()` 调 `resolveTranscriptTools(messages)`，
+   该函数**只扫描 system 消息的 `toolsAdded` 字段**，`context.tools` 被完全忽略。
+   所以 `attachToolsToSystem()` 把工具挂到首条 system 消息上。
+   （这也是上游 MoA 传 `tools: []` 时"看起来传了但没生效"的原因）
+
+2. **工具循环**：`runLlmWithTools()` 最多 `MAX_TOOL_ROUNDS`（默认 5）轮，
+   模型返回 tool-call → 本地执行 → tool 结果 + user 摘要回灌 → 再调用。
+
+3. **原生流事件**：pi-ai 发 `toolcall_end` / `done`，DSH 适配器发 `block-end`，
+   两种都识别。
+
+4. **安全边界**
+   - 所有文件路径必须落在 `cwd` 内（`path.relative` 越界即拒绝）
+   - `bash` 仅在显式开启时可用，且必须命中只读白名单（ls/cat/grep/find/git status…），
+     含 `>`、`rm`、`|sh`、`sudo` 等一律拒绝
+   - 工具执行失败回灌为文本，不中断流水线
+
+### 配置
+
+```yaml
+presets:
+  - name: default
+    tools: true                      # 只读文件 + 联网搜索（默认）
+    # tools: false                   # 关闭，回到上游纯文本行为
+    # tools: ["read_file","grep_files"]
+    # tools: { file: true, bash: false, web: true }
+    tools_max_rounds: 5
+```

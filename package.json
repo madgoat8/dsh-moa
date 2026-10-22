@@ -1,7 +1,7 @@
 {
   "name": "@yongfan/dsh-moa",
-  "version": "0.2.57-local.1",
-  "description": "Mixture of Agents (MoA) plugin for DeepSeek Harness — local fork with DSH 0.2.x pi-ai message adapter",
+  "version": "0.2.57-local.2",
+  "description": "MoA plugin for DeepSeek Harness — local fork: pi-ai message adapter + read-only tool calling",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
