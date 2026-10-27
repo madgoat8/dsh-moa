@@ -189,3 +189,113 @@ MoA 在本机主要用于**规划（plan）制定阶段**：三方独立出方�
 
 - ❌ 跨候选工具结果共享 — 会削弱三方独立性
 - ❌ 模型工具可靠性统计 — 无状态更简单，plan 场景使用频率不高
+
+## 0.2.57-local.5 — advisory 保真 / 按槽位裁剪 / 记账与失败语义
+
+这一版修的三个问题是**当前就在发生**的，不是潜在风险。前两个的根因都在消息适配层。
+
+### 1. system prompt 从未到达候选模型（严重）
+
+`moa-prompts.js#cleanAdvisoryMessages` 只放行 `user` / `assistant`，`system` 被直接丢弃；
+随后 `moa-llm.js#attachToolsToSystem` 发现没有 system，就补一条
+`"You are a helpful assistant."`。
+
+后果：`SYSTEM_ROLE_PROPOSER`（1546 字符）、`TOOL_USAGE_DIRECTIVE`（1019 字符，local.4
+的 A' 事前引导）、`role_persona`、项目上下文快照——**全部没有进过模型**。
+
+```js
+// 复现（local.4）
+cleanAdvisoryMessages([{role:'system',content:'RULES'},{role:'user',content:'hi'}])
+// → [{role:'user',content:'hi'}]       system 消失
+```
+
+修复：`ANSWER_ROLES` 增加 `system`，`cleanAdvisoryMessages` 保留 system，`toHarnessMessages`
+不合并相邻 system（合并会让 `toolsAdded` 挂错位置）。
+
+### 2. 只发工具调用、不带正文的 assistant 消息被丢弃
+
+`normalizeMessage` 先判 `if (!text) return null`，再看 tool-call。模型"本轮只调工具不说话"
+是常见行为，结果 assistant 消息消失，留下**孤立的 tool 消息**，严格上游直接 400。
+
+修复：先判 tool-call，正文为空时保留 block 数组。
+
+### 3. 工具结果重复投喂
+
+`runLlmWithTools` 既 push `role:'tool'` 消息，又把同样的结果拼成
+`## 工具 X 返回\n…` 的 user 消息。修复：只保留 tool 消息，user 消息仅在**有失败时**
+补一句修正引导。
+
+### 4. advisory 视图保真（对齐 Hermes `_reference_messages`）
+
+| 项 | local.4 | local.5 |
+|---|---|---|
+| assistant 的 tool-call | 丢弃 | 内联 `[called tool: name(args)]` |
+| tool 结果 | 丢弃 | 折叠进前一条 assistant，头尾 4000 字符 + 省略量标注 |
+| 纯图片 user 轮 | 丢弃（破坏交替） | `[user sent non-text content …]` 占位 |
+| 尾随 assistant | 原样 | 追加 `ADVISORY_INSTRUCTION` 合成 user |
+
+### 5. 按槽位裁剪上下文
+
+新增 `moa-context.js#trimMessagesForAdvisor` + `pricing.js#resolveModelContextLength`。
+每个 advisor 按**自己的**窗口裁剪：`budget = window × 0.9 − reserve(默认 8192)`，
+保留 system 头部，从最旧开始丢，丢后若以 assistant 开头继续丢，至少留尾部 user 一条。
+
+窗口来源优先级：槽位 `context_window` → 自定义 prices 的 `contextLength` → 直接厂商费率
+→ OpenRouter 目录 → 0（未知 → **不裁剪**，宁可原样发也不按猜测砍历史）。
+
+顺带修掉一个相关问题：目录记录里的 `contextLength` 此前在 `normalizeRates` 被丢弃。
+
+### 6. 多轮连续性从死代码变成真的能用
+
+`extractPriorTurnBaseline` 要求 `assistant.content` 是字符串，而 DSH 0.2.x 是块数组
+→ 多轮基线**恒为 null**。`pruneMultiTurnMessages` 对块数组 `JSON.stringify`，会把
+reasoning / tool-call 元数据当正文喂给模型。两处都改为只取可见文本。
+
+### 7. judge 终于能看到代码
+
+候选文本 >3000 字符时，`stripOrSummarizeCode` 把**每个代码块**替换成
+`> 📄 *[code - N lines saved to disk]*` —— 裁判在看不到代码的情况下评分。
+
+新增 `moa-parser.js#renderCandidateForJudge`：预算内原文给出；超预算时优先保留代码块
+（每块均分 70% 预算，块内再超则头尾保留），只裁散文，并**明说**省略了多少字符。
+`buildSynthesisPrompt` / `buildCuratorSynthesisPrompt` / `buildPeerCritiquePrompt`
+三处全部改用它；`stripOrSummarizeCode` 仅保留给聊天展示。
+
+### 8. 记账：多轮工具调用的 token 不再丢
+
+`invokeOnce` 只返回**最后一个** stream chunk 的 usage，`runLlmWithTools` 直接透传
+→ 前几轮无论跑多久都不计费。现在逐轮累加（含 `cached_tokens`），轮次耗尽时那次
+强制作答也计入。
+
+### 9. 失败语义
+
+`moa-stream.js` 在管线报错时也发 `finish{kind:'stop'}`，宿主把失败回合记成成功。
+现在：
+- `result.error` → `finish{kind:'error', failure.code}`
+- 全部候选失败 → `MOA_ALL_REFERENCE_FAILED`
+- 预算熔断（`failureKind: 'budget-abort'`）是用户配置的守卫生效，**仍以 stop 正常结束**
+
+### 新增配置
+
+```yaml
+presets:
+  - name: default
+    trim_context: true        # 按 advisor 自己的窗口裁剪（默认开）
+    reference_models:
+      - provider: magpie
+        model: workbuddy-ai/hy3
+        context_window: 200000 # 可选：显式窗口，0 = 查目录
+```
+
+### 测试
+
+仓库此前声明了 `test` 脚本但 `test/` 目录不存在。本版建立 suite：
+
+```bash
+cd dsh-moa-work
+node --import ./test/_setup.mjs --test test/*.test.mjs
+# tests 40 / pass 40
+```
+
+覆盖：advisory 视图（system 保留、tool 折叠、图片占位、配对完整）、按槽位裁剪
+（含预算为负、窗口未知）、judge 代码可见性、usage 累加、失败流语义。
